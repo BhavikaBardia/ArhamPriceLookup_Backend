@@ -72,6 +72,28 @@ function doGet(e) {
       result = getAllPricing();
     } else if (action === "getAllData") {
       result = getAllData();
+    } else if (action === "saveQuotation") {
+      var payload = null;
+      if (e && e.parameter && e.parameter.data) {
+        payload = JSON.parse(e.parameter.data);
+      } else if (e && e.parameter && e.parameter.payload) {
+        payload = JSON.parse(e.parameter.payload);
+      } else {
+        payload = e ? e.parameter : {};
+      }
+      result = saveQuotation(payload);
+    } else if (action === "confirmOrder") {
+      var payload = null;
+      if (e && e.parameter && e.parameter.data) {
+        payload = JSON.parse(e.parameter.data);
+      } else if (e && e.parameter && e.parameter.payload) {
+        payload = JSON.parse(e.parameter.payload);
+      } else {
+        payload = e ? e.parameter : {};
+      }
+      result = confirmQuotationOrder(payload);
+    } else if (action === "getQuotations") {
+      result = getQuotations();
     } else if (action === "getHealth") {
       result = getHealth();
     } else {
@@ -114,6 +136,12 @@ function doPost(e) {
       result = getAllPricing();
     } else if (action === "getAllData") {
       result = getAllData();
+    } else if (action === "saveQuotation") {
+      result = saveQuotation(payload);
+    } else if (action === "confirmOrder") {
+      result = confirmQuotationOrder(payload);
+    } else if (action === "getQuotations") {
+      result = getQuotations();
     } else if (action === "getHealth") {
       result = getHealth();
     } else {
@@ -901,7 +929,9 @@ function upsertPricing(payload) {
   
   var existingRowIndex = -1;
   for (var i = 1; i < data.length; i++) {
-    if (String(data[i][0]).trim() === cid && String(data[i][1]).trim() === pid) {
+    var rowCid = String(data[i][0]).trim().toUpperCase();
+    var rowPid = String(data[i][1]).trim().toUpperCase();
+    if (rowCid === cid.toUpperCase() && rowPid === pid.toUpperCase()) {
       existingRowIndex = i + 1; // 1-indexed sheet row
       break;
     }
@@ -951,6 +981,397 @@ function upsertPricing(payload) {
   };
 }
 
+// Helper: Format Date as YYYY-MM-DD (removes GMT/timezone text)
+function formatDateOnly(val) {
+  if (!val) return "";
+  if (Object.prototype.toString.call(val) === "[object Date]" || val instanceof Date) {
+    return Utilities.formatDate(val, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  }
+  var s = String(val).trim();
+  if (s.indexOf("GMT") !== -1 || s.indexOf("Standard Time") !== -1) {
+    try {
+      var d = new Date(s);
+      if (!isNaN(d.getTime())) {
+        return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
+      }
+    } catch (e) {}
+  }
+  if (s.indexOf("T") !== -1) {
+    return s.split("T")[0];
+  }
+  return s;
+}
+
+// -------------------------------------------------------------
+// Action: Save Quotation to 'Quotations' Sheet
+// -------------------------------------------------------------
+function saveQuotation(payload) {
+  var ss = getSpreadsheet();
+  if (!ss) throw new Error("Google Spreadsheet not accessible.");
+  ensureSheetsExist(ss);
+  
+  if (!payload) throw new Error("Quotation payload is empty.");
+  
+  var quotationNo = String(payload.quotation_no || payload.quotationNo || "").trim();
+  if (!quotationNo) {
+    var now = new Date();
+    quotationNo = "ARH-QT-" + Utilities.formatDate(now, Session.getScriptTimeZone(), "yyyyMMdd-HHmmss") + "-" + Math.floor(100 + Math.random() * 900);
+  }
+  
+  var quotationDate = formatDateOnly(payload.quotation_date || payload.quotationDate);
+  var validUntil = formatDateOnly(payload.valid_until || payload.validUntil);
+  var customerId = String(payload.customer_id || payload.customerId || "").trim();
+  var customerName = String(payload.customer_name || payload.customerName || "").trim();
+  var customerGstin = String(payload.customer_gstin || payload.customerGstin || "").trim();
+  
+  var subtotal = Number(payload.subtotal) || 0;
+  var discountAmount = Number(payload.discount_amount !== undefined ? payload.discount_amount : payload.discountAmount) || 0;
+  var taxableAmount = Number(payload.taxable_amount !== undefined ? payload.taxable_amount : payload.taxableAmount) || 0;
+  var taxRate = Number(payload.tax_rate !== undefined ? payload.tax_rate : payload.taxRate) || 0;
+  var taxAmount = Number(payload.tax_amount !== undefined ? payload.tax_amount : payload.taxAmount) || 0;
+  var roundOff = Number(payload.round_off !== undefined ? payload.round_off : payload.roundOff) || 0;
+  var grandTotal = Number(payload.grand_total !== undefined ? payload.grand_total : payload.grandTotal) || 0;
+  var terms = String(payload.terms || "").trim();
+  var savedAt = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+  
+  var items = Array.isArray(payload.items) ? payload.items : [];
+  if (items.length === 0) {
+    throw new Error("Quotation must contain at least one line item.");
+  }
+  
+  var sheet = ss.getSheetByName("Quotations");
+  if (!sheet) {
+    sheet = ss.insertSheet("Quotations");
+    var headers = [
+      "Quotation No", "Quotation Date", "Valid Till", "Customer ID", "Customer Name", "Customer GSTIN",
+      "Item #", "Product ID", "Product Name", "Make / Brand", "UOM", "Qty", "Unit Rate", "Total Amount",
+      "Remark", "Subtotal", "Discount", "Taxable Amount", "Tax Rate", "Tax Amount",
+      "Round Off", "Grand Total", "Terms & Conditions", "Saved At", "Order Status", "Confirmed At"
+    ];
+    sheet.appendRow(headers);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#f1f5f9");
+  } else if (sheet.getLastRow() >= 1 && sheet.getLastColumn() >= 1) {
+    // Automatically clean (₹) and (%) from existing header row if present
+    var currentHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    var needsHeaderUpdate = false;
+    for (var c = 0; c < currentHeaders.length; c++) {
+      var h = String(currentHeaders[c] || "");
+      if (h.indexOf("(₹)") !== -1 || h.indexOf("(%)") !== -1) {
+        currentHeaders[c] = h.replace(/\s*\(₹\)/g, "").replace(/\s*\(%\)/g, "").trim();
+        needsHeaderUpdate = true;
+      }
+    }
+    if (needsHeaderUpdate) {
+      sheet.getRange(1, 1, 1, currentHeaders.length).setValues([currentHeaders]);
+    }
+  }
+  
+  var orderStatus = String(payload.order_status || payload.orderStatus || "PENDING").trim();
+  var confirmedAt = String(payload.confirmed_at || payload.confirmedAt || "").trim();
+
+  // 1. Check if an existing quotation with this number is already CONFIRMED
+  var data = sheet.getDataRange().getValues();
+  if (data.length > 1) {
+    for (var i = 1; i < data.length; i++) {
+      var rowQNo = String(data[i][0] || "").trim().toUpperCase();
+      var rowStatus = String(data[i][24] || "").trim().toUpperCase();
+      if (rowQNo === quotationNo.toUpperCase() && rowStatus === "CONFIRMED") {
+        throw new Error("Quotation '" + quotationNo + "' is already confirmed as an order and cannot be edited or modified.");
+      }
+    }
+  }
+
+  // 2. Delete previous draft rows for this Quotation No to prevent duplicates when updating
+  if (data.length > 1) {
+    for (var i = data.length - 1; i >= 1; i--) {
+      var rowQNo = String(data[i][0] || "").trim();
+      if (rowQNo.toUpperCase() === quotationNo.toUpperCase()) {
+        sheet.deleteRow(i + 1);
+      }
+    }
+  }
+  
+  // 2. Prepare new rows to append
+  var rowsToAppend = [];
+  for (var idx = 0; idx < items.length; idx++) {
+    var item = items[idx];
+    var itemNo = idx + 1;
+    var productId = String(item.product_id || item.productId || "").trim();
+    var productName = String(item.product_name || item.productName || item.standard_name || "").trim();
+    var make = String(item.make || "").trim();
+    var uom = String(item.uom || "Nos").trim();
+    var qty = Number(item.qty) || 0;
+    var rate = Number(item.rate) || 0;
+    var discountVal = Number(item.discount_val) || 0;
+    var discountType = String(item.discount_type || "percent");
+    var discountedRate = item.discounted_rate !== undefined ? Number(item.discounted_rate) : (discountVal > 0 ? (discountType === 'fixed' ? Math.max(0, rate - discountVal) : Math.max(0, rate - (rate * discountVal)/100)) : rate);
+    var total = (Number(item.total) !== undefined && Number(item.total) > 0) ? Number(item.total) : (qty * discountedRate);
+    var remark = String(item.remark || "").trim();
+    
+    rowsToAppend.push([
+      quotationNo,
+      quotationDate,
+      validUntil,
+      customerId,
+      customerName,
+      customerGstin,
+      itemNo,
+      productId,
+      productName,
+      make,
+      uom,
+      qty,
+      rate,
+      total,
+      remark,
+      subtotal,
+      discountAmount,
+      taxableAmount,
+      taxRate,
+      taxAmount,
+      roundOff,
+      grandTotal,
+      terms,
+      savedAt,
+      orderStatus,
+      confirmedAt,
+      discountVal,
+      discountType,
+      discountedRate
+    ]);
+  }
+  
+  if (rowsToAppend.length > 0) {
+    var startRow = sheet.getLastRow() + 1;
+    var numRows = rowsToAppend.length;
+    var numCols = rowsToAppend[0].length;
+    sheet.getRange(startRow, 1, numRows, numCols).setValues(rowsToAppend);
+  }
+  
+  return {
+    success: true,
+    message: "Quotation '" + quotationNo + "' saved successfully to Google Sheets ('Quotations' sheet)",
+    quotation_no: quotationNo,
+    items_count: items.length,
+    grand_total: grandTotal,
+    saved_at: savedAt,
+    order_status: orderStatus,
+    confirmed_at: confirmedAt
+  };
+}
+
+// -------------------------------------------------------------
+// Action: Retrieve Saved Quotations
+// -------------------------------------------------------------
+function getQuotations() {
+  var ss = getSpreadsheet();
+  if (!ss) return [];
+  ensureSheetsExist(ss);
+  
+  var sheet = ss.getSheetByName("Quotations");
+  if (!sheet) return [];
+  
+  var data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return [];
+  
+  var quotationsMap = {};
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var qNo = String(row[0] || "").trim();
+    if (!qNo) continue;
+    
+    if (!quotationsMap[qNo]) {
+      quotationsMap[qNo] = {
+        quotation_no: qNo,
+        quotation_date: formatDateOnly(row[1]),
+        valid_until: formatDateOnly(row[2]),
+        customer_id: String(row[3] || ""),
+        customer_name: String(row[4] || ""),
+        customer_gstin: String(row[5] || ""),
+        subtotal: Number(row[15]) || 0,
+        discount_amount: Number(row[16]) || 0,
+        taxable_amount: Number(row[17]) || 0,
+        tax_rate: Number(row[18]) || 0,
+        tax_amount: Number(row[19]) || 0,
+        round_off: Number(row[20]) || 0,
+        grand_total: Number(row[21]) || 0,
+        terms: String(row[22] || ""),
+        saved_at: formatDateOnly(row[23]),
+        order_status: String(row[24] || "PENDING").trim(),
+        confirmed_at: formatDateOnly(row[25]),
+        items: []
+      };
+    }
+    
+    var itemRate = Number(row[12]) || 0;
+    var itemTotal = Number(row[13]) || 0;
+    var itemQty = Number(row[11]) || 1;
+    var itemDiscVal = (row.length > 26 && row[26] !== "" && !isNaN(Number(row[26]))) ? Number(row[26]) : 0;
+    var itemDiscType = (row.length > 27 && row[27]) ? String(row[27]) : "percent";
+    var itemDiscRate = (row.length > 28 && row[28] !== "" && !isNaN(Number(row[28]))) ? Number(row[28]) : null;
+
+    if (itemDiscRate === null || isNaN(itemDiscRate)) {
+      if (itemDiscVal > 0) {
+        itemDiscRate = itemDiscType === 'fixed' ? Math.max(0, itemRate - itemDiscVal) : Math.max(0, itemRate - (itemRate * itemDiscVal) / 100);
+      } else if (itemQty > 0 && itemTotal > 0 && itemTotal < itemQty * itemRate) {
+        itemDiscRate = Math.round((itemTotal / itemQty) * 100) / 100;
+        itemDiscVal = Math.round(((itemRate - itemDiscRate) / itemRate) * 1000) / 10;
+        itemDiscType = "percent";
+      } else {
+        itemDiscRate = itemRate;
+      }
+    }
+
+    quotationsMap[qNo].items.push({
+      item_no: row[6],
+      product_id: row[7],
+      product_name: row[8],
+      make: row[9],
+      uom: row[10],
+      qty: itemQty,
+      rate: itemRate,
+      discount_val: itemDiscVal,
+      discount_type: itemDiscType,
+      discounted_rate: itemDiscRate,
+      total: itemTotal,
+      remark: row[14]
+    });
+  }
+  
+  var result = [];
+  for (var key in quotationsMap) {
+    result.push(quotationsMap[key]);
+  }
+  return result;
+}
+
+// -------------------------------------------------------------
+// Action: Confirm Quotation Order & Update Customer Pricing
+// -------------------------------------------------------------
+function confirmQuotationOrder(payload) {
+  var ss = getSpreadsheet();
+  if (!ss) throw new Error("Google Spreadsheet not accessible.");
+  ensureSheetsExist(ss);
+  
+  var quotationNo = String(payload.quotation_no || payload.quotationNo || "").trim();
+  var customerId = String(payload.customer_id || payload.customerId || "").trim();
+  var items = Array.isArray(payload.items) ? payload.items : [];
+  
+  if (!customerId) throw new Error("Customer ID is required to confirm order.");
+  if (items.length === 0) throw new Error("No line items found to confirm.");
+
+  // Check if this quotation was already confirmed
+  var quoteSheet = ss.getSheetByName("Quotations");
+  if (quoteSheet && quotationNo) {
+    var qData = quoteSheet.getDataRange().getValues();
+    if (qData.length > 1) {
+      for (var r = 1; r < qData.length; r++) {
+        var rQNo = String(qData[r][0] || "").trim().toUpperCase();
+        var rStatus = String(qData[r][24] || "").trim().toUpperCase();
+        if (rQNo === quotationNo.toUpperCase() && rStatus === "CONFIRMED") {
+          throw new Error("Quotation '" + quotationNo + "' has already been confirmed as an order and cannot be re-confirmed.");
+        }
+      }
+    }
+  }
+  
+  // 1. Build map of products for name-to-ID fallback matching
+  var prodSheet = ss.getSheetByName("Products");
+  var prodData = prodSheet ? prodSheet.getDataRange().getValues() : [];
+  var prodNameMap = {};
+  if (prodData.length > 1) {
+    for (var p = 1; p < prodData.length; p++) {
+      var pId = String(prodData[p][0] || "").trim();
+      var pName = String(prodData[p][1] || "").trim().toUpperCase();
+      if (pId && pName) {
+        prodNameMap[pName] = pId;
+      }
+    }
+  }
+  
+  // 2. Loop through each item and update pricing with history
+  var updatedItems = [];
+  var skippedItems = [];
+  
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i];
+    var pid = String(it.product_id || it.productId || "").trim();
+    var pName = String(it.product_name || it.productName || it.standard_name || "").trim();
+    var rate = parseFloat(it.discounted_rate !== undefined && it.discounted_rate !== null ? it.discounted_rate : (it.rate !== undefined ? it.rate : it.price));
+    
+    // Fallback: match by product name if product_id is empty
+    if (!pid && pName && prodNameMap[pName.toUpperCase()]) {
+      pid = prodNameMap[pName.toUpperCase()];
+    }
+    
+    if (pid && !isNaN(rate) && rate > 0) {
+      try {
+        var upRes = upsertPricing({
+          customer_id: customerId,
+          product_id: pid,
+          price: rate
+        });
+        updatedItems.push({
+          product_id: pid,
+          product_name: pName,
+          price: rate,
+          previous_price: upRes.data ? upRes.data.previous_price : null,
+          history: upRes.data ? upRes.data.price_history : ""
+        });
+      } catch (e) {
+        skippedItems.push({ product_id: pid, reason: e.message });
+      }
+    } else {
+      skippedItems.push({ product_id: pid || pName, reason: "Missing product ID or invalid price" });
+    }
+  }
+  
+  // 3. Mark Quotations sheet status as CONFIRMED
+  var confirmTime = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+  var quoteSheet = ss.getSheetByName("Quotations");
+  if (quoteSheet && quotationNo) {
+    var qData = quoteSheet.getDataRange().getValues();
+    if (qData.length > 1) {
+      var headers = qData[0];
+      var statusColIdx = 24; // Column Y (0-indexed 24)
+      var confirmedAtColIdx = 25; // Column Z (0-indexed 25)
+      
+      // Look for dynamic header indices if columns were shifted
+      for (var h = 0; h < headers.length; h++) {
+        var hName = String(headers[h] || "").trim().toLowerCase();
+        if (hName === "order status" || hName === "status") statusColIdx = h;
+        if (hName === "confirmed at" || hName === "order confirmed at") confirmedAtColIdx = h;
+      }
+      
+      // Ensure headers exist if sheet had fewer columns
+      if (headers.length <= statusColIdx) {
+        quoteSheet.getRange(1, statusColIdx + 1).setValue("Order Status").setFontWeight("bold").setBackground("#f1f5f9");
+      }
+      if (headers.length <= confirmedAtColIdx) {
+        quoteSheet.getRange(1, confirmedAtColIdx + 1).setValue("Confirmed At").setFontWeight("bold").setBackground("#f1f5f9");
+      }
+      
+      for (var r = 1; r < qData.length; r++) {
+        if (String(qData[r][0] || "").trim().toUpperCase() === quotationNo.toUpperCase()) {
+          quoteSheet.getRange(r + 1, statusColIdx + 1).setValue("CONFIRMED");
+          quoteSheet.getRange(r + 1, confirmedAtColIdx + 1).setValue(confirmTime);
+        }
+      }
+    }
+  }
+  
+  return {
+    success: true,
+    message: "Order confirmed successfully! Updated customer prices for " + updatedItems.length + " item(s) with price history.",
+    quotation_no: quotationNo,
+    customer_id: customerId,
+    updated_count: updatedItems.length,
+    updated_items: updatedItems,
+    skipped_items: skippedItems,
+    confirmed_at: confirmTime
+  };
+}
+
 // -------------------------------------------------------------
 // Helper: Levenshtein Distance Similarity
 // -------------------------------------------------------------
@@ -985,7 +1406,38 @@ function ensureSheetsExist(ss) {
   var sheetsToCreate = [
     { name: "Customers", headers: ["Customer ID", "Customer Name", "Contact Person", "Phone", "Email", "Address", "GSTIN"] },
     { name: "Products", headers: ["Product ID", "Standard Product Name", "Make"] },
-    { name: "Pricing", headers: ["Customer ID", "Product ID", "Customer Price", "Previous Price", "Last Updated", "Price History"] }
+    { name: "Pricing", headers: ["Customer ID", "Product ID", "Customer Price", "Previous Price", "Last Updated", "Price History"] },
+    { 
+      name: "Quotations", 
+      headers: [
+        "Quotation No",
+        "Quotation Date",
+        "Valid Till",
+        "Customer ID",
+        "Customer Name",
+        "Customer GSTIN",
+        "Item #",
+        "Product ID",
+        "Product Name",
+        "Make / Brand",
+        "UOM",
+        "Qty",
+        "Unit Rate",
+        "Total Amount",
+        "Remark",
+        "Subtotal",
+        "Discount",
+        "Taxable Amount",
+        "Tax Rate",
+        "Tax Amount",
+        "Round Off",
+        "Grand Total",
+        "Terms & Conditions",
+        "Saved At",
+        "Order Status",
+        "Confirmed At"
+      ] 
+    }
   ];
   
   for (var i = 0; i < sheetsToCreate.length; i++) {
@@ -995,6 +1447,19 @@ function ensureSheetsExist(ss) {
       sheet = ss.insertSheet(item.name);
       sheet.appendRow(item.headers);
       sheet.getRange(1, 1, 1, item.headers.length).setFontWeight("bold").setBackground("#f1f5f9");
+    } else if (item.name === "Quotations" && sheet.getLastRow() >= 1 && sheet.getLastColumn() >= 1) {
+      var currentHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+      var needsHeaderUpdate = false;
+      for (var c = 0; c < currentHeaders.length; c++) {
+        var h = String(currentHeaders[c] || "");
+        if (h.indexOf("(₹)") !== -1 || h.indexOf("(%)") !== -1) {
+          currentHeaders[c] = h.replace(/\s*\(₹\)/g, "").replace(/\s*\(%\)/g, "").trim();
+          needsHeaderUpdate = true;
+        }
+      }
+      if (needsHeaderUpdate) {
+        sheet.getRange(1, 1, 1, currentHeaders.length).setValues([currentHeaders]);
+      }
     }
   }
 }
